@@ -215,10 +215,11 @@ class GitHubClient:
         return alerts
 
     def get_recent_incidents(self, repo_full_name: str) -> list[RepoIncident]:
-        """Search for recent incident/hotfix/outage issues in a repo using the search API."""
+        """Search for recent incident/hotfix/outage issues and revert PRs in a repo."""
         incidents = []
+
+        # Search 1: Issues with incident-related labels
         try:
-            # Single search query instead of per-label lookups (avoids rate limits)
             label_terms = " ".join(
                 f"label:{l}" for l in ["incident", "hotfix", "outage", "sev1", "sev2", "P0", "P1"]
             )
@@ -238,7 +239,28 @@ class GitHubClient:
                 ))
                 count += 1
         except Exception as e:
-            logger.debug("Incident search failed for %s: %s", repo_full_name, e)
+            logger.debug("Incident label search failed for %s: %s", repo_full_name, e)
+
+        # Search 2: Revert PRs (strong signal of an incident/rollback)
+        try:
+            query = f"repo:{repo_full_name} is:pr Revert in:title"
+            results = self.gh.search_issues(query, sort="created", order="desc")
+            count = 0
+            for pr in results:
+                if count >= 10:
+                    break
+                incidents.append(RepoIncident(
+                    repo_full_name=repo_full_name,
+                    title=pr.title,
+                    url=pr.html_url,
+                    state=pr.state,
+                    created_at=pr.created_at.strftime("%Y-%m-%d"),
+                    labels=["revert"] + [l.name for l in pr.labels],
+                ))
+                count += 1
+        except Exception as e:
+            logger.debug("Revert PR search failed for %s: %s", repo_full_name, e)
+
         return incidents
 
     def get_file_content(self, repo_full_name: str, path: str) -> str | None:
