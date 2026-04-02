@@ -104,6 +104,25 @@ class BlastRadiusAnalyzer:
                 except Exception as e:
                     logger.warning("Skipping package consumer search for '%s': %s", dep, e)
 
+        # Search for other repos that use the same packages being changed
+        # (shows which services share this dependency and may need the same upgrade)
+        shared_pkg_refs = []
+        if pr_diff.package_changes and not all_downstream_refs:
+            for pc in pr_diff.package_changes:
+                try:
+                    time.sleep(2)
+                    refs = self.github.search_package_consumers(pc.name)
+                    external_refs = [r for r in refs if r.repo_full_name != source_repo]
+                    shared_pkg_refs.extend(external_refs)
+                    logger.info("Package '%s': used by %d other repos", pc.name, len(external_refs))
+                except Exception as e:
+                    logger.warning("Skipping shared-package search for '%s': %s", pc.name, e)
+            # Add to downstream refs — these are "shared dependency" impacts
+            all_downstream_refs.extend(shared_pkg_refs)
+
+        # Build set of repos from shared-package search
+        shared_pkg_repos = {r.repo_full_name for r in shared_pkg_refs} if pr_diff.package_changes else set()
+
         # Step 3: Deduplicate and group references by repo
         seen_refs = set()
         unique_downstream_refs = []
@@ -117,11 +136,12 @@ class BlastRadiusAnalyzer:
         downstream_by_repo: dict[str, DownstreamImpact] = {}
         for ref in all_downstream_refs:
             if ref.repo_full_name not in downstream_by_repo:
+                impact_type = "shared-dependency" if ref.repo_full_name in shared_pkg_repos else "unknown"
                 downstream_by_repo[ref.repo_full_name] = DownstreamImpact(
                     repo=ref.repo_full_name,
                     files=[],
                     symbols_matched=[],
-                    impact_type="unknown",
+                    impact_type=impact_type,
                 )
             impact = downstream_by_repo[ref.repo_full_name]
             if ref.file_path not in impact.files:

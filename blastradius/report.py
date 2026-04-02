@@ -66,21 +66,47 @@ def format_report(report: BlastRadiusReport) -> str:
     ]
 
     # Downstream impacts table
-    if report.downstream_impacts:
-        lines.append(f"### Downstream Services Affected ({len(report.downstream_impacts)})")
+    code_impacts = [i for i in report.downstream_impacts if i.impact_type != "shared-dependency"]
+    pkg_impacts = [i for i in report.downstream_impacts if i.impact_type == "shared-dependency"]
+
+    if code_impacts:
+        lines.append(f"### Downstream Services Affected ({len(code_impacts)})")
         lines.append("")
         lines.append("| Service | Files | Impact | Deploy Order |")
         lines.append("|---------|-------|--------|-------------|")
-        for impact in report.downstream_impacts:
+        for impact in code_impacts:
             files = ", ".join(impact.files[:3])
             if len(impact.files) > 3:
                 files += f" +{len(impact.files) - 3} more"
             order = f"① Deploy first" if impact.blocking else (f"Step {impact.deploy_order}" if impact.deploy_order else "⚡ Non-blocking")
             lines.append(f"| `{impact.repo}` | {files} | {impact.impact_type} | {order} |")
         lines.append("")
-    else:
+    elif not pkg_impacts:
         lines.append("### ✅ No downstream services affected")
         lines.append("")
+
+    # Shared dependency services
+    if pkg_impacts:
+        # Group by package
+        pkg_repos: dict[str, list[DownstreamImpact]] = {}
+        for impact in pkg_impacts:
+            for sym in impact.symbols_matched:
+                pkg_repos.setdefault(sym, []).append(impact)
+
+        lines.append(f"### 🔗 Services Sharing Changed Dependencies ({len(pkg_impacts)} repos)")
+        lines.append("")
+        lines.append("> These services also use the same packages being changed in this PR and may need similar upgrades.")
+        lines.append("")
+        for pkg_name, impacts in pkg_repos.items():
+            lines.append(f"**`{pkg_name}`** — used by {len(impacts)} other services:")
+            lines.append("")
+            lines.append("| Service | Dependency File |")
+            lines.append("|---------|----------------|")
+            for impact in impacts:
+                repo_short = impact.repo.split("/")[-1] if "/" in impact.repo else impact.repo
+                dep_file = impact.files[0] if impact.files else "—"
+                lines.append(f"| `{repo_short}` | {dep_file} |")
+            lines.append("")
 
     # Deploy order (if needed)
     if report.deploy_order:
@@ -251,14 +277,21 @@ def generate_mermaid_dag(
             lines.append(f"    {pr_id} --> {repo_id}")
             node_styles[repo_id] = RISK_COLOR["LOW"]
 
-    # Add downstream nodes not in deploy order
+    # Add code-impact downstream nodes not in deploy order
     order_repos = {step.get("repo") for step in deploy_order}
     for impact in downstream:
-        if impact.repo not in order_repos:
+        if impact.repo not in order_repos and impact.impact_type != "shared-dependency":
             repo_id = _safe_id(impact.repo)
             lines.append(f'    {repo_id}["{impact.repo}"]')
             lines.append(f"    {pr_id} -.-> {repo_id}")
             node_styles[repo_id] = "#94a3b8"
+
+    # Collect shared-dependency repos grouped by package for linking later
+    shared_dep_by_pkg: dict[str, list[str]] = {}
+    for impact in downstream:
+        if impact.impact_type == "shared-dependency":
+            for sym in impact.symbols_matched:
+                shared_dep_by_pkg.setdefault(sym, []).append(impact.repo)
 
     # --- Package dependency nodes ---
     if has_packages:
@@ -279,11 +312,29 @@ def generate_mermaid_dag(
             color = {"added": "#22c55e", "removed": "#ef4444", "updated": "#3b82f6"}.get(change, "#94a3b8")
             node_styles[pkg_id] = color
 
+            # Link shared-dependency repos to this package node
+            import re as _re
+            pkg_normalized = _re.sub(r"[-_.]+", "-", pkg_name).lower()
+            for dep_pkg, dep_repos in shared_dep_by_pkg.items():
+                if _re.sub(r"[-_.]+", "-", dep_pkg).lower() == pkg_normalized:
+                    # Cap at 5 repos to keep the chart readable
+                    for repo_name in dep_repos[:5]:
+                        short = repo_name.split("/")[-1] if "/" in repo_name else repo_name
+                        dep_repo_id = _safe_id(f"dep_{short}")
+                        if dep_repo_id not in node_styles:
+                            lines.append(f'    {dep_repo_id}["{short}"]')
+                            lines.append(f"    {pkg_id} -.->|also uses| {dep_repo_id}")
+                            node_styles[dep_repo_id] = "#94a3b8"
+                    if len(dep_repos) > 5:
+                        more_id = _safe_id(f"more_{pkg_name}")
+                        lines.append(f'    {more_id}["+{len(dep_repos) - 5} more"]')
+                        lines.append(f"    {pkg_id} -.-> {more_id}")
+                        node_styles[more_id] = "#94a3b8"
+
             # Link resolved vulns to their package
             for vuln in vulnerabilities:
                 if vuln.get("pr_impact") == "potentially_resolved":
                     vuln_pkg = vuln.get("package", "")
-                    import re as _re
                     if _re.sub(r"[-_.]+", "-", vuln_pkg).lower() == _re.sub(r"[-_.]+", "-", pkg_name).lower():
                         vuln_id = _safe_id(f"vuln_{vuln_pkg}_{vuln.get('severity', '')}")
                         if vuln_id not in node_styles:
