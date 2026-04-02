@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import asdict
 
@@ -128,41 +129,56 @@ class BlastRadiusAnalyzer:
             if ref.symbol not in impact.symbols_matched:
                 impact.symbols_matched.append(ref.symbol)
 
-        # Step 3b: Vulnerability scan + incident history for source + downstream repos
+        # Step 3b: Vulnerability scan + incident history for current repo only
         all_vulnerabilities = []
         all_repo_incidents = []
-        repos_to_scan = [source_repo] + list(downstream_by_repo.keys())
-        for repo_full_name in repos_to_scan:
-            try:
-                vulns = self.github.get_vulnerability_alerts(repo_full_name)
-                for v in vulns:
-                    all_vulnerabilities.append({
-                        "repo": repo_full_name.split("/")[-1],
-                        "package": v.package,
-                        "severity": v.severity,
-                        "summary": v.summary,
-                    })
-            except Exception as e:
-                logger.warning("Vulnerability scan failed for %s: %s", repo_full_name, e)
 
-            try:
-                incs = self.github.get_recent_incidents(repo_full_name)
-                for inc in incs:
-                    all_repo_incidents.append({
-                        "repo": repo_full_name.split("/")[-1],
-                        "title": inc.title,
-                        "url": inc.url,
-                        "state": inc.state,
-                        "date": inc.created_at,
-                        "labels": inc.labels,
-                    })
-            except Exception as e:
-                logger.warning("Incident search failed for %s: %s", repo_full_name, e)
+        # Build set of packages being changed in this PR
+        changed_pkg_names = {re.sub(r"[-_.]+", "-", pc.name).lower() for pc in pr_diff.package_changes}
+        updated_pkg_names = {
+            re.sub(r"[-_.]+", "-", pc.name).lower()
+            for pc in pr_diff.package_changes if pc.change_type == "updated"
+        }
+
+        try:
+            vulns = self.github.get_vulnerability_alerts(source_repo)
+            for v in vulns:
+                pkg_normalized = re.sub(r"[-_.]+", "-", v.package).lower()
+                if pkg_normalized in updated_pkg_names:
+                    pr_impact = "potentially_resolved"
+                elif pkg_normalized in changed_pkg_names:
+                    pr_impact = "affected"
+                else:
+                    pr_impact = "existing"
+                all_vulnerabilities.append({
+                    "repo": source_repo.split("/")[-1],
+                    "package": v.package,
+                    "severity": v.severity,
+                    "summary": v.summary,
+                    "patched_version": v.patched_version,
+                    "pr_impact": pr_impact,
+                })
+        except Exception as e:
+            logger.warning("Vulnerability scan failed for %s: %s", source_repo, e)
+
+        try:
+            incs = self.github.get_recent_incidents(source_repo)
+            for inc in incs:
+                all_repo_incidents.append({
+                    "repo": source_repo.split("/")[-1],
+                    "title": inc.title,
+                    "url": inc.url,
+                    "state": inc.state,
+                    "date": inc.created_at,
+                    "labels": inc.labels,
+                })
+        except Exception as e:
+            logger.warning("Incident search failed for %s: %s", source_repo, e)
 
         if all_vulnerabilities:
-            logger.info("Found %d vulnerability alerts across downstream repos", len(all_vulnerabilities))
+            logger.info("Found %d vulnerability alerts in %s", len(all_vulnerabilities), source_repo)
         if all_repo_incidents:
-            logger.info("Found %d recent incidents across downstream repos", len(all_repo_incidents))
+            logger.info("Found %d recent incidents in %s", len(all_repo_incidents), source_repo)
 
         # Step 4: Query Datadog for runtime dependencies (if configured)
         runtime_deps = []
@@ -277,6 +293,11 @@ class BlastRadiusAnalyzer:
             mermaid_dag=mermaid,
             vulnerabilities=all_vulnerabilities,
             repo_incidents=all_repo_incidents,
+            package_changes=[
+                {"name": pc.name, "change_type": pc.change_type,
+                 "old_version": pc.old_version, "new_version": pc.new_version}
+                for pc in pr_diff.package_changes
+            ],
         )
 
         return format_report(report)

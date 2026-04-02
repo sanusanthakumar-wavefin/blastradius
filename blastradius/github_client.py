@@ -38,6 +38,7 @@ class PRDiff:
     changed_symbols: list[ChangedSymbol] = field(default_factory=list)
     added_dependencies: list[str] = field(default_factory=list)
     removed_dependencies: list[str] = field(default_factory=list)
+    package_changes: list[PackageChange] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +63,16 @@ class VersionPin:
 
 
 @dataclass
+class PackageChange:
+    """A package dependency change detected in the PR diff."""
+
+    name: str
+    change_type: str  # "added", "removed", "updated"
+    old_version: str | None = None
+    new_version: str | None = None
+
+
+@dataclass
 class VulnerabilityAlert:
     """A Dependabot / security vulnerability alert on a repo."""
 
@@ -70,6 +81,7 @@ class VulnerabilityAlert:
     severity: str  # "critical", "high", "medium", "low"
     summary: str
     advisory_url: str
+    patched_version: str | None = None
 
 
 @dataclass
@@ -109,6 +121,7 @@ class GitHubClient:
 
         # Extract dependency changes
         added_deps, removed_deps = self._extract_dependency_changes(diff_text, changed_files)
+        package_changes = self._extract_package_changes(diff_text, changed_files)
 
         return PRDiff(
             owner=owner,
@@ -121,6 +134,7 @@ class GitHubClient:
             changed_symbols=changed_symbols,
             added_dependencies=added_deps,
             removed_dependencies=removed_deps,
+            package_changes=package_changes,
         )
 
     def search_org_for_symbol(self, symbol: str) -> list[DownstreamRef]:
@@ -186,12 +200,15 @@ class GitHubClient:
                 summary = alert.get("security_advisory", {}).get("summary", "")
                 pkg = alert.get("security_vulnerability", {}).get("package", {}).get("name", "unknown")
                 url = alert.get("html_url", "")
+                patched = alert.get("security_vulnerability", {}).get("first_patched_version")
+                patched_version = patched.get("identifier") if patched else None
                 alerts.append(VulnerabilityAlert(
                     repo_full_name=repo_full_name,
                     package=pkg,
                     severity=severity,
                     summary=summary,
                     advisory_url=url,
+                    patched_version=patched_version,
                 ))
         except Exception as e:
             logger.debug("Dependabot alerts not available for %s: %s", repo_full_name, e)
@@ -374,6 +391,80 @@ class GitHubClient:
                     removed.append(match.group(1))
 
         return added, removed
+
+    def _extract_package_changes(self, diff_text: str, changed_files: list[str]) -> list[PackageChange]:
+        """Detect package changes with version info from dependency files in the PR diff."""
+        dep_filenames = (
+            "pyproject.toml", "requirements.txt", "requirements-dev.txt",
+            "requirements-test.txt", "package.json", "Pipfile", "setup.cfg",
+        )
+        dep_files = [f for f in changed_files if any(f.endswith(n) for n in dep_filenames)]
+        if not dep_files:
+            return []
+
+        # Split diff into per-file sections and only parse dependency file sections
+        dep_file_set = set(dep_files)
+        dep_diff_lines: list[str] = []
+        in_dep_section = False
+        for line in diff_text.split("\n"):
+            if line.startswith("--- a/") or line.startswith("+++ b/"):
+                filepath = line.split("/", 1)[1] if "/" in line else ""
+                in_dep_section = filepath in dep_file_set
+                continue
+            if in_dep_section:
+                dep_diff_lines.append(line)
+
+        added_pkgs: dict[str, str] = {}
+        removed_pkgs: dict[str, str] = {}
+
+        pyproject_re = re.compile(r'"([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)(?:\[.*?\])?\s*([><=~!^][^"]*)?')
+        req_re = re.compile(r'([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)(?:\[.*?\])?\s*([><=~!^][\S]*)?')
+
+        for line in dep_diff_lines:
+            if not (line.startswith("+") or line.startswith("-")):
+                continue
+
+            is_add = line.startswith("+")
+            target = added_pkgs if is_add else removed_pkgs
+            clean = line[1:].strip()
+            if not clean or clean.startswith("#") or clean.startswith("["):
+                continue
+
+            # Try quoted format (pyproject.toml)
+            m = pyproject_re.search(clean)
+            if m:
+                name = re.sub(r"[-_.]+", "-", m.group(1)).lower()
+                target[name] = (m.group(2) or "").strip()
+                continue
+
+            # Try unquoted format (requirements.txt)
+            m = req_re.match(clean)
+            if m and not clean.startswith(("def ", "class ", "import ", "from ")):
+                name = re.sub(r"[-_.]+", "-", m.group(1)).lower()
+                target[name] = (m.group(2) or "").strip()
+
+        changes: list[PackageChange] = []
+        for pkg in sorted(set(added_pkgs) | set(removed_pkgs)):
+            # Skip pure version strings (e.g. "178-4-1") and very short names
+            if re.match(r"^\d[\d.-]*$", pkg) or len(pkg) < 2:
+                continue
+            if pkg in added_pkgs and pkg in removed_pkgs:
+                changes.append(PackageChange(
+                    name=pkg, change_type="updated",
+                    old_version=removed_pkgs[pkg] or None,
+                    new_version=added_pkgs[pkg] or None,
+                ))
+            elif pkg in added_pkgs:
+                changes.append(PackageChange(
+                    name=pkg, change_type="added",
+                    new_version=added_pkgs[pkg] or None,
+                ))
+            else:
+                changes.append(PackageChange(
+                    name=pkg, change_type="removed",
+                    old_version=removed_pkgs[pkg] or None,
+                ))
+        return changes
 
     def _is_likely_rename(self, old: str, new: str) -> bool:
         """Guess if two symbol names are a rename of each other."""

@@ -51,6 +51,7 @@ class BlastRadiusReport:
     incidents: list[dict] = field(default_factory=list)
     vulnerabilities: list[dict] = field(default_factory=list)
     repo_incidents: list[dict] = field(default_factory=list)
+    package_changes: list[dict] = field(default_factory=list)
     mermaid_dag: str = ""
 
 
@@ -101,43 +102,79 @@ def format_report(report: BlastRadiusReport) -> str:
             lines.append(f"- **[{inc.get('severity', '?')}]** {inc.get('title', '?')} ({inc.get('date', '?')}{ttr})")
         lines.append("")
 
+    # Package changes section
+    if report.package_changes:
+        lines.append(f"### 📦 Package Changes in This PR ({len(report.package_changes)})")
+        lines.append("")
+        lines.append("| Package | Change | Version |")
+        lines.append("|---------|--------|---------|")
+        for pc in report.package_changes:
+            icon = {"added": "➕", "removed": "➖", "updated": "🔄"}.get(pc.get("change_type", ""), "•")
+            if pc.get("change_type") == "updated":
+                ver = f"`{pc.get('old_version', '?')}` → `{pc.get('new_version', '?')}`"
+            elif pc.get("change_type") == "added":
+                ver = f"`{pc.get('new_version', '?')}`" if pc.get("new_version") else "—"
+            else:
+                ver = f"`{pc.get('old_version', '?')}`" if pc.get("old_version") else "—"
+            lines.append(f"| `{pc.get('name', '?')}` | {icon} {pc.get('change_type', '?')} | {ver} |")
+        lines.append("")
+
     # Vulnerability alerts
     if report.vulnerabilities:
+        resolved = [v for v in report.vulnerabilities if v.get("pr_impact") == "potentially_resolved"]
+        existing = [v for v in report.vulnerabilities if v.get("pr_impact") != "potentially_resolved"]
         critical = [v for v in report.vulnerabilities if v.get("severity") == "critical"]
         high = [v for v in report.vulnerabilities if v.get("severity") == "high"]
-        medium = [v for v in report.vulnerabilities if v.get("severity") == "medium"]
-        low = [v for v in report.vulnerabilities if v.get("severity") == "low"]
 
         lines.append(f"### 🛡️ Vulnerability Scan ({len(report.vulnerabilities)} open alerts)")
         lines.append("")
-        if critical or high:
-            lines.append("> ⚠️ **Downstream repos have unpatched security vulnerabilities!**")
+
+        if resolved:
+            lines.append(f"#### ✅ Potentially Resolved by This PR ({len(resolved)})")
             lines.append("")
-        lines.append("| Repo | Package | Severity | Summary |")
-        lines.append("|------|---------|----------|---------|")
-        for vuln in sorted(report.vulnerabilities, key=lambda v: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(v.get("severity", ""), 4)):
-            sev_emoji = {"critical": "🚨", "high": "🔴", "medium": "🟡", "low": "🟢"}.get(vuln.get("severity", ""), "❓")
-            summary = vuln.get("summary", "")[:80]
-            repo = vuln.get("repo", "?")
-            lines.append(f"| `{repo}` | `{vuln.get('package', '?')}` | {sev_emoji} {vuln.get('severity', '?')} | {summary} |")
-        lines.append("")
+            lines.append("> These vulnerabilities may be fixed by the package updates in this PR.")
+            lines.append("")
+            lines.append("| Package | Severity | Summary | Fixed In |")
+            lines.append("|---------|----------|---------|----------|")
+            for vuln in sorted(resolved, key=lambda v: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(v.get("severity", ""), 4)):
+                sev_emoji = {"critical": "🚨", "high": "🔴", "medium": "🟡", "low": "🟢"}.get(vuln.get("severity", ""), "❓")
+                summary = vuln.get("summary", "")[:80]
+                patched = f"`{vuln.get('patched_version')}`" if vuln.get("patched_version") else "—"
+                lines.append(f"| `{vuln.get('package', '?')}` | {sev_emoji} {vuln.get('severity', '?')} | {summary} | {patched} |")
+            lines.append("")
+
+        if existing:
+            label = "Remaining" if resolved else "Existing"
+            lines.append(f"#### ⚠️ {label} Vulnerabilities ({len(existing)})")
+            lines.append("")
+            if critical or high:
+                lines.append("> ⚠️ **Unpatched security vulnerabilities in this repo!**")
+                lines.append("")
+            lines.append("| Package | Severity | Summary |")
+            lines.append("|---------|----------|---------|")
+            for vuln in sorted(existing, key=lambda v: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(v.get("severity", ""), 4)):
+                sev_emoji = {"critical": "🚨", "high": "🔴", "medium": "🟡", "low": "🟢"}.get(vuln.get("severity", ""), "❓")
+                summary = vuln.get("summary", "")[:80]
+                lines.append(f"| `{vuln.get('package', '?')}` | {sev_emoji} {vuln.get('severity', '?')} | {summary} |")
+            lines.append("")
+
         if critical:
-            lines.append(f"> 🚨 **{len(critical)} CRITICAL** vulnerabilities in downstream repos — coordinate patching!")
+            lines.append(f"> 🚨 **{len(critical)} CRITICAL** vulnerabilities — coordinate patching!")
             lines.append("")
 
     # Recent incidents from GitHub issues
     if report.repo_incidents:
         lines.append(f"### 🔥 Recent Incidents ({len(report.repo_incidents)} found)")
         lines.append("")
-        lines.append("> These downstream repos had recent incidents/hotfixes:")
+        lines.append("> Recent incidents/hotfixes in this repo:")
         lines.append("")
-        lines.append("| Repo | Issue | Status | Date | Labels |")
-        lines.append("|------|-------|--------|------|--------|")
+        lines.append("| Issue | Status | Date | Labels |")
+        lines.append("|-------|--------|------|--------|")
         for inc in report.repo_incidents:
             state_icon = "✅" if inc.get("state") == "closed" else "🔴"
             labels = ", ".join(f"`{l}`" for l in inc.get("labels", [])[:3])
             title = inc.get("title", "?")[:60]
-            lines.append(f"| `{inc.get('repo', '?')}` | [{title}]({inc.get('url', '')}) | {state_icon} {inc.get('state', '?')} | {inc.get('date', '?')} | {labels} |")
+            lines.append(f"| [{title}]({inc.get('url', '')}) | {state_icon} {inc.get('state', '?')} | {inc.get('date', '?')} | {labels} |")
         lines.append("")
 
     # Mermaid DAG
