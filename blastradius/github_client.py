@@ -61,6 +61,29 @@ class VersionPin:
     will_auto_update: bool
 
 
+@dataclass
+class VulnerabilityAlert:
+    """A Dependabot / security vulnerability alert on a repo."""
+
+    repo_full_name: str
+    package: str
+    severity: str  # "critical", "high", "medium", "low"
+    summary: str
+    advisory_url: str
+
+
+@dataclass
+class RepoIncident:
+    """A recent incident/hotfix/outage issue found in a repo."""
+
+    repo_full_name: str
+    title: str
+    url: str
+    state: str
+    created_at: str
+    labels: list[str]
+
+
 class GitHubClient:
     """Interacts with GitHub API for blast radius analysis."""
 
@@ -147,6 +170,69 @@ class GitHubClient:
             except Exception as e:
                 logger.warning("Package search failed for '%s' in %s: %s", package_name, filename, e)
         return refs
+
+    def get_vulnerability_alerts(self, repo_full_name: str) -> list[VulnerabilityAlert]:
+        """Get Dependabot security alerts for a repo using the REST API."""
+        alerts = []
+        try:
+            # Use the underlying requester to call the Dependabot alerts endpoint
+            headers, data = self.gh._Github__requester.requestJsonAndCheck(
+                "GET",
+                f"/repos/{repo_full_name}/dependabot/alerts",
+                parameters={"state": "open", "per_page": 10},
+            )
+            for alert in data:
+                severity = alert.get("security_advisory", {}).get("severity", "unknown")
+                summary = alert.get("security_advisory", {}).get("summary", "")
+                pkg = alert.get("security_vulnerability", {}).get("package", {}).get("name", "unknown")
+                url = alert.get("html_url", "")
+                alerts.append(VulnerabilityAlert(
+                    repo_full_name=repo_full_name,
+                    package=pkg,
+                    severity=severity,
+                    summary=summary,
+                    advisory_url=url,
+                ))
+        except Exception as e:
+            logger.debug("Dependabot alerts not available for %s: %s", repo_full_name, e)
+        return alerts
+
+    def get_recent_incidents(self, repo_full_name: str) -> list[RepoIncident]:
+        """Search for recent incident/hotfix/outage issues in a repo."""
+        incidents = []
+        try:
+            repo_obj = self.gh.get_repo(repo_full_name)
+            # Search for issues with incident-related labels
+            for label_name in ["incident", "hotfix", "outage", "bug", "sev1", "sev2", "P0", "P1"]:
+                try:
+                    label = repo_obj.get_label(label_name)
+                    issues = repo_obj.get_issues(labels=[label], state="all", sort="created", direction="desc")
+                    count = 0
+                    for issue in issues:
+                        if count >= 5:
+                            break
+                        incidents.append(RepoIncident(
+                            repo_full_name=repo_full_name,
+                            title=issue.title,
+                            url=issue.html_url,
+                            state=issue.state,
+                            created_at=issue.created_at.strftime("%Y-%m-%d"),
+                            labels=[l.name for l in issue.labels],
+                        ))
+                        count += 1
+                except Exception:
+                    pass  # label doesn't exist
+        except Exception as e:
+            logger.debug("Incident search failed for %s: %s", repo_full_name, e)
+
+        # Deduplicate by URL
+        seen = set()
+        unique = []
+        for inc in incidents:
+            if inc.url not in seen:
+                seen.add(inc.url)
+                unique.append(inc)
+        return unique[:10]
 
     def get_file_content(self, repo_full_name: str, path: str) -> str | None:
         """Read a file from a remote repo."""

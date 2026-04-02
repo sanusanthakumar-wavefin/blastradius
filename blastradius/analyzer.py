@@ -122,6 +122,41 @@ class BlastRadiusAnalyzer:
             if ref.symbol not in impact.symbols_matched:
                 impact.symbols_matched.append(ref.symbol)
 
+        # Step 3b: Vulnerability scan + incident history for downstream repos
+        all_vulnerabilities = []
+        all_repo_incidents = []
+        for repo_full_name in downstream_by_repo:
+            try:
+                vulns = self.github.get_vulnerability_alerts(repo_full_name)
+                for v in vulns:
+                    all_vulnerabilities.append({
+                        "repo": repo_full_name.split("/")[-1],
+                        "package": v.package,
+                        "severity": v.severity,
+                        "summary": v.summary,
+                    })
+            except Exception as e:
+                logger.warning("Vulnerability scan failed for %s: %s", repo_full_name, e)
+
+            try:
+                incs = self.github.get_recent_incidents(repo_full_name)
+                for inc in incs:
+                    all_repo_incidents.append({
+                        "repo": repo_full_name.split("/")[-1],
+                        "title": inc.title,
+                        "url": inc.url,
+                        "state": inc.state,
+                        "date": inc.created_at,
+                        "labels": inc.labels,
+                    })
+            except Exception as e:
+                logger.warning("Incident search failed for %s: %s", repo_full_name, e)
+
+        if all_vulnerabilities:
+            logger.info("Found %d vulnerability alerts across downstream repos", len(all_vulnerabilities))
+        if all_repo_incidents:
+            logger.info("Found %d recent incidents across downstream repos", len(all_repo_incidents))
+
         # Step 4: Query Datadog for runtime dependencies (if configured)
         runtime_deps = []
         incidents = []
@@ -188,7 +223,7 @@ class BlastRadiusAnalyzer:
             )
         else:
             ai_result = self._heuristic_analysis(
-                pr_diff, all_downstream_refs, downstream_by_repo
+                pr_diff, all_downstream_refs, downstream_by_repo, all_vulnerabilities
             )
 
         # Step 6: Enrich downstream impacts with AI deploy order
@@ -233,17 +268,21 @@ class BlastRadiusAnalyzer:
             runtime_deps=runtime_deps,
             incidents=incidents,
             mermaid_dag=mermaid,
+            vulnerabilities=all_vulnerabilities,
+            repo_incidents=all_repo_incidents,
         )
 
         return format_report(report)
 
-    def _heuristic_analysis(self, pr_diff, downstream_refs, downstream_by_repo):
+    def _heuristic_analysis(self, pr_diff, downstream_refs, downstream_by_repo, vulnerabilities=None):
         """Rule-based risk analysis when OpenAI is not available."""
         from .ai_analyzer import RiskAnalysis
 
         num_downstream = len(downstream_by_repo)
         has_removals = any(s.change_type == "removed" for s in pr_diff.changed_symbols)
         has_renames = any(s.change_type == "renamed" for s in pr_diff.changed_symbols)
+        critical_vulns = len([v for v in (vulnerabilities or []) if v.get("severity") == "critical"])
+        high_vulns = len([v for v in (vulnerabilities or []) if v.get("severity") == "high"])
 
         # Determine risk level heuristically
         if num_downstream == 0:
@@ -308,6 +347,18 @@ class BlastRadiusAnalyzer:
             warnings.append("This PR renames symbols — downstream repos may need updates.")
         if not warnings and num_downstream > 0:
             warnings.append("Changes appear non-breaking but downstream repos reference modified code.")
+
+        # Factor in vulnerabilities
+        if critical_vulns > 0:
+            warnings.append(f"🚨 {critical_vulns} CRITICAL vulnerabilities in downstream repos — coordinate patching!")
+            if risk_level == "LOW":
+                risk_level = "MEDIUM"
+                reason += f" However, {critical_vulns} critical vulnerabilities exist in downstream repos."
+            elif risk_level == "MEDIUM":
+                risk_level = "HIGH"
+                reason += f" Additionally, {critical_vulns} critical vulnerabilities increase risk."
+        elif high_vulns > 0:
+            warnings.append(f"⚠️ {high_vulns} HIGH severity vulnerabilities in downstream repos.")
 
         return RiskAnalysis(
             risk_level=risk_level,

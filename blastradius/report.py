@@ -49,6 +49,8 @@ class BlastRadiusReport:
     safe_to_merge: bool
     runtime_deps: list[dict] = field(default_factory=list)
     incidents: list[dict] = field(default_factory=list)
+    vulnerabilities: list[dict] = field(default_factory=list)
+    repo_incidents: list[dict] = field(default_factory=list)
     mermaid_dag: str = ""
 
 
@@ -88,15 +90,54 @@ def format_report(report: BlastRadiusReport) -> str:
             lines.append(f"{step.get('step', '•')}. `{step.get('repo', '?')}` — {step.get('action', '?')}{blocking}")
         lines.append("")
 
-    # Incident memory
+    # Incident memory (from Datadog)
     if report.incidents:
-        lines.append("### ⚠️ Incident History")
+        lines.append("### ⚠️ Incident History (Datadog)")
         lines.append("")
         lines.append("> These services/files were involved in recent incidents:")
         lines.append("")
         for inc in report.incidents:
             ttr = f", TTR: {inc.get('ttr', '?')}" if inc.get("ttr") else ""
             lines.append(f"- **[{inc.get('severity', '?')}]** {inc.get('title', '?')} ({inc.get('date', '?')}{ttr})")
+        lines.append("")
+
+    # Vulnerability alerts
+    if report.vulnerabilities:
+        critical = [v for v in report.vulnerabilities if v.get("severity") == "critical"]
+        high = [v for v in report.vulnerabilities if v.get("severity") == "high"]
+        medium = [v for v in report.vulnerabilities if v.get("severity") == "medium"]
+        low = [v for v in report.vulnerabilities if v.get("severity") == "low"]
+
+        lines.append(f"### 🛡️ Vulnerability Scan ({len(report.vulnerabilities)} open alerts)")
+        lines.append("")
+        if critical or high:
+            lines.append("> ⚠️ **Downstream repos have unpatched security vulnerabilities!**")
+            lines.append("")
+        lines.append("| Repo | Package | Severity | Summary |")
+        lines.append("|------|---------|----------|---------|")
+        for vuln in sorted(report.vulnerabilities, key=lambda v: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(v.get("severity", ""), 4)):
+            sev_emoji = {"critical": "🚨", "high": "🔴", "medium": "🟡", "low": "🟢"}.get(vuln.get("severity", ""), "❓")
+            summary = vuln.get("summary", "")[:80]
+            repo = vuln.get("repo", "?")
+            lines.append(f"| `{repo}` | `{vuln.get('package', '?')}` | {sev_emoji} {vuln.get('severity', '?')} | {summary} |")
+        lines.append("")
+        if critical:
+            lines.append(f"> 🚨 **{len(critical)} CRITICAL** vulnerabilities in downstream repos — coordinate patching!")
+            lines.append("")
+
+    # Recent incidents from GitHub issues
+    if report.repo_incidents:
+        lines.append(f"### 🔥 Recent Incidents ({len(report.repo_incidents)} found)")
+        lines.append("")
+        lines.append("> These downstream repos had recent incidents/hotfixes:")
+        lines.append("")
+        lines.append("| Repo | Issue | Status | Date | Labels |")
+        lines.append("|------|-------|--------|------|--------|")
+        for inc in report.repo_incidents:
+            state_icon = "✅" if inc.get("state") == "closed" else "🔴"
+            labels = ", ".join(f"`{l}`" for l in inc.get("labels", [])[:3])
+            title = inc.get("title", "?")[:60]
+            lines.append(f"| `{inc.get('repo', '?')}` | [{title}]({inc.get('url', '')}) | {state_icon} {inc.get('state', '?')} | {inc.get('date', '?')} | {labels} |")
         lines.append("")
 
     # Mermaid DAG
