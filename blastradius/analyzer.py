@@ -128,10 +128,11 @@ class BlastRadiusAnalyzer:
             if ref.symbol not in impact.symbols_matched:
                 impact.symbols_matched.append(ref.symbol)
 
-        # Step 3b: Vulnerability scan + incident history for downstream repos
+        # Step 3b: Vulnerability scan + incident history for source + downstream repos
         all_vulnerabilities = []
         all_repo_incidents = []
-        for repo_full_name in downstream_by_repo:
+        repos_to_scan = [source_repo] + list(downstream_by_repo.keys())
+        for repo_full_name in repos_to_scan:
             try:
                 vulns = self.github.get_vulnerability_alerts(repo_full_name)
                 for v in vulns:
