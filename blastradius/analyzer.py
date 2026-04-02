@@ -162,7 +162,11 @@ class BlastRadiusAnalyzer:
             logger.warning("Vulnerability scan failed for %s: %s", source_repo, e)
 
         try:
-            incs = self.github.get_recent_incidents(source_repo)
+            incs = self.github.get_recent_incidents(
+                source_repo,
+                changed_files=set(pr_diff.changed_files),
+                package_names={pc.name for pc in pr_diff.package_changes},
+            )
             for inc in incs:
                 all_repo_incidents.append({
                     "repo": source_repo.split("/")[-1],

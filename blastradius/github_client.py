@@ -214,9 +214,24 @@ class GitHubClient:
             logger.debug("Dependabot alerts not available for %s: %s", repo_full_name, e)
         return alerts
 
-    def get_recent_incidents(self, repo_full_name: str) -> list[RepoIncident]:
-        """Search for recent incident/hotfix/outage issues and revert PRs in a repo."""
+    # Lock files that are too generic for incident file-overlap matching
+    LOCK_FILES = {"poetry.lock", "package-lock.json", "yarn.lock", "Pipfile.lock", "Gemfile.lock"}
+
+    def get_recent_incidents(
+        self,
+        repo_full_name: str,
+        changed_files: set[str] | None = None,
+        package_names: set[str] | None = None,
+    ) -> list[RepoIncident]:
+        """Search for incidents (revert PRs, labeled issues) that overlap with changed files/packages."""
         incidents = []
+        repository = self.gh.get_repo(repo_full_name)
+
+        # Non-lock files for meaningful overlap check
+        meaningful_files = (
+            {f for f in changed_files if f.split("/")[-1] not in self.LOCK_FILES}
+            if changed_files else set()
+        )
 
         # Search 1: Issues with incident-related labels
         try:
@@ -241,23 +256,44 @@ class GitHubClient:
         except Exception as e:
             logger.debug("Incident label search failed for %s: %s", repo_full_name, e)
 
-        # Search 2: Revert PRs (strong signal of an incident/rollback)
+        # Search 2: Revert PRs — only include if they touch the same files or packages
         try:
             query = f"repo:{repo_full_name} is:pr Revert in:title"
             results = self.gh.search_issues(query, sort="created", order="desc")
             count = 0
-            for pr in results:
-                if count >= 10:
+            for item in results:
+                if count >= 20:  # check up to 20 candidates
                     break
+                count += 1
+
+                if changed_files:
+                    # Check 1: Meaningful (non-lock) file overlap
+                    file_match = False
+                    if meaningful_files:
+                        try:
+                            revert_pr = repository.get_pull(item.number)
+                            revert_files = {f.filename for f in revert_pr.get_files()}
+                            file_match = bool(revert_files.intersection(meaningful_files))
+                        except Exception:
+                            pass
+
+                    # Check 2: Package name in title (for dependency-only PRs)
+                    pkg_match = False
+                    if package_names and not file_match:
+                        title_lower = item.title.lower()
+                        pkg_match = any(pkg.lower() in title_lower for pkg in package_names)
+
+                    if not file_match and not pkg_match:
+                        continue
+
                 incidents.append(RepoIncident(
                     repo_full_name=repo_full_name,
-                    title=pr.title,
-                    url=pr.html_url,
-                    state=pr.state,
-                    created_at=pr.created_at.strftime("%Y-%m-%d"),
-                    labels=["revert"] + [l.name for l in pr.labels],
+                    title=item.title,
+                    url=item.html_url,
+                    state=item.state,
+                    created_at=item.created_at.strftime("%Y-%m-%d"),
+                    labels=["revert"] + [l.name for l in item.labels],
                 ))
-                count += 1
         except Exception as e:
             logger.debug("Revert PR search failed for %s: %s", repo_full_name, e)
 
