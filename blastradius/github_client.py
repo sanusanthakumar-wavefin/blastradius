@@ -198,41 +198,31 @@ class GitHubClient:
         return alerts
 
     def get_recent_incidents(self, repo_full_name: str) -> list[RepoIncident]:
-        """Search for recent incident/hotfix/outage issues in a repo."""
+        """Search for recent incident/hotfix/outage issues in a repo using the search API."""
         incidents = []
         try:
-            repo_obj = self.gh.get_repo(repo_full_name)
-            # Search for issues with incident-related labels
-            for label_name in ["incident", "hotfix", "outage", "bug", "sev1", "sev2", "P0", "P1"]:
-                try:
-                    label = repo_obj.get_label(label_name)
-                    issues = repo_obj.get_issues(labels=[label], state="all", sort="created", direction="desc")
-                    count = 0
-                    for issue in issues:
-                        if count >= 5:
-                            break
-                        incidents.append(RepoIncident(
-                            repo_full_name=repo_full_name,
-                            title=issue.title,
-                            url=issue.html_url,
-                            state=issue.state,
-                            created_at=issue.created_at.strftime("%Y-%m-%d"),
-                            labels=[l.name for l in issue.labels],
-                        ))
-                        count += 1
-                except Exception:
-                    pass  # label doesn't exist
+            # Single search query instead of per-label lookups (avoids rate limits)
+            label_terms = " ".join(
+                f"label:{l}" for l in ["incident", "hotfix", "outage", "sev1", "sev2", "P0", "P1"]
+            )
+            query = f"repo:{repo_full_name} is:issue {label_terms}"
+            results = self.gh.search_issues(query, sort="created", order="desc")
+            count = 0
+            for issue in results:
+                if count >= 10:
+                    break
+                incidents.append(RepoIncident(
+                    repo_full_name=repo_full_name,
+                    title=issue.title,
+                    url=issue.html_url,
+                    state=issue.state,
+                    created_at=issue.created_at.strftime("%Y-%m-%d"),
+                    labels=[l.name for l in issue.labels],
+                ))
+                count += 1
         except Exception as e:
             logger.debug("Incident search failed for %s: %s", repo_full_name, e)
-
-        # Deduplicate by URL
-        seen = set()
-        unique = []
-        for inc in incidents:
-            if inc.url not in seen:
-                seen.add(inc.url)
-                unique.append(inc)
-        return unique[:10]
+        return incidents
 
     def get_file_content(self, repo_full_name: str, path: str) -> str | None:
         """Read a file from a remote repo."""
@@ -326,6 +316,40 @@ class GitHubClient:
         for method in grpc_methods:
             if method not in [s.name for s in symbols]:
                 symbols.append(ChangedSymbol(name=method, change_type="removed", file_path="(from diff)"))
+
+        # Class/enum definitions added or removed
+        removed_classes = set(re.findall(r"^-\s*class\s+(\w+)", diff_text, re.MULTILINE))
+        added_classes = set(re.findall(r"^\+\s*class\s+(\w+)", diff_text, re.MULTILINE))
+        for name in removed_classes - added_classes:
+            if name not in [s.name for s in symbols]:
+                symbols.append(ChangedSymbol(name=name, change_type="removed", file_path="(from diff)"))
+        for name in added_classes - removed_classes:
+            if name not in [s.name for s in symbols]:
+                symbols.append(ChangedSymbol(name=name, change_type="added", file_path="(from diff)"))
+
+        # Enum members (UPPER_CASE = "value") and constants
+        removed_enums = set(re.findall(r"^-\s+([A-Z][A-Z0-9_]{2,})\s*=", diff_text, re.MULTILINE))
+        added_enums = set(re.findall(r"^\+\s+([A-Z][A-Z0-9_]{2,})\s*=", diff_text, re.MULTILINE))
+        for name in removed_enums - added_enums:
+            if name not in [s.name for s in symbols]:
+                symbols.append(ChangedSymbol(name=name, change_type="removed", file_path="(from diff)"))
+        for name in added_enums - removed_enums:
+            if name not in [s.name for s in symbols]:
+                symbols.append(ChangedSymbol(name=name, change_type="added", file_path="(from diff)"))
+
+        # Dataclass/TypedDict field additions/removals (name: Type pattern)
+        removed_fields = set(re.findall(r"^-\s+(\w+)\s*:\s*\w+", diff_text, re.MULTILINE))
+        added_fields = set(re.findall(r"^\+\s+(\w+)\s*:\s*\w+", diff_text, re.MULTILINE))
+        # Filter out common noise (self, return, type, etc.)
+        noise = {"self", "return", "type", "status", "str", "int", "bool", "float", "dict", "list", "None"}
+        removed_fields -= noise
+        added_fields -= noise
+        for name in removed_fields - added_fields:
+            if name not in [s.name for s in symbols] and len(name) >= 5:
+                symbols.append(ChangedSymbol(name=name, change_type="removed", file_path="(from diff)"))
+        for name in added_fields - removed_fields:
+            if name not in [s.name for s in symbols] and len(name) >= 5:
+                symbols.append(ChangedSymbol(name=name, change_type="added", file_path="(from diff)"))
 
         return symbols
 

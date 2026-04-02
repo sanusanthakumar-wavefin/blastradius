@@ -73,6 +73,12 @@ class BlastRadiusAnalyzer:
                 "manager", "factory", "helper", "context", "serializer",
                 "field", "value", "state", "status", "action", "event",
                 "result", "response", "request", "command", "query",
+                "partial", "complete", "completed", "pending", "active",
+                "enabled", "disabled", "default", "message", "description",
+                "provider_name", "created_at", "updated_at", "deleted_at",
+                "is_active", "is_deleted", "created", "updated",
+                "transaction_count", "batch_date_start", "batch_date_end",
+                "is_historical", "transactions", "connector_id",
             ):
                 logger.info("Skipping generic symbol '%s'", search_name)
                 continue

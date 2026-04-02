@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--output", default="blastradius_report.md", help="Output file path")
     parser.add_argument("--org", default="waveaccounting", help="GitHub org to search")
     parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model to use")
+    parser.add_argument("--comment", action="store_true", help="Post report as a PR comment on GitHub")
     args = parser.parse_args()
 
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -58,6 +59,30 @@ def main():
     with open(args.output, "w") as f:
         f.write(report)
     logger.info("Report written to %s", args.output)
+
+    # Post as PR comment if requested
+    if args.comment:
+        try:
+            from github import Auth, Github
+
+            gh = Github(auth=Auth.Token(github_token), retry=None)
+            repo_obj = gh.get_repo(f"{args.owner}/{args.repo}")
+            pr_obj = repo_obj.get_pull(args.pr)
+
+            # Delete any previous BlastRadius comment to avoid spam
+            for comment in pr_obj.get_issue_comments():
+                if comment.body and "BlastRadius Report" in comment.body:
+                    comment.delete()
+                    logger.info("Deleted previous BlastRadius comment")
+
+            pr_obj.create_issue_comment(report)
+            logger.info(
+                "Posted report as comment on %s/%s#%d",
+                args.owner, args.repo, args.pr,
+            )
+        except Exception as e:
+            logger.error("Failed to post PR comment: %s", e)
+            sys.exit(1)
 
     # Also print to stdout
     print(report)
