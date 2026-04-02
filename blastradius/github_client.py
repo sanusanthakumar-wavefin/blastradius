@@ -397,22 +397,32 @@ class GitHubClient:
         dep_filenames = (
             "pyproject.toml", "requirements.txt", "requirements-dev.txt",
             "requirements-test.txt", "package.json", "Pipfile", "setup.cfg",
+            "poetry.lock",
         )
         dep_files = [f for f in changed_files if any(f.endswith(n) for n in dep_filenames)]
         if not dep_files:
             return []
 
+        # Check if we're dealing with a poetry.lock file
+        has_poetry_lock = any(f.endswith("poetry.lock") for f in dep_files)
+
         # Split diff into per-file sections and only parse dependency file sections
         dep_file_set = set(dep_files)
         dep_diff_lines: list[str] = []
+        current_file = ""
         in_dep_section = False
         for line in diff_text.split("\n"):
             if line.startswith("--- a/") or line.startswith("+++ b/"):
                 filepath = line.split("/", 1)[1] if "/" in line else ""
                 in_dep_section = filepath in dep_file_set
+                current_file = filepath
                 continue
             if in_dep_section:
-                dep_diff_lines.append(line)
+                dep_diff_lines.append((line, current_file))
+
+        # For poetry.lock: parse [[package]] blocks to extract name + version pairs
+        if has_poetry_lock:
+            return self._extract_poetry_lock_changes(dep_diff_lines)
 
         added_pkgs: dict[str, str] = {}
         removed_pkgs: dict[str, str] = {}
@@ -420,7 +430,7 @@ class GitHubClient:
         pyproject_re = re.compile(r'"([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)(?:\[.*?\])?\s*([><=~!^][^"]*)?')
         req_re = re.compile(r'([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)(?:\[.*?\])?\s*([><=~!^][\S]*)?')
 
-        for line in dep_diff_lines:
+        for line, _file in dep_diff_lines:
             if not (line.startswith("+") or line.startswith("-")):
                 continue
 
@@ -463,6 +473,87 @@ class GitHubClient:
                 changes.append(PackageChange(
                     name=pkg, change_type="removed",
                     old_version=removed_pkgs[pkg] or None,
+                ))
+        return changes
+
+    def _extract_poetry_lock_changes(self, lines: list[tuple[str, str]]) -> list[PackageChange]:
+        """Parse poetry.lock diff to extract package name/version changes."""
+        # poetry.lock format: name = "pkg" and version = "1.2.3" lines within [[package]] blocks
+        # We track removed vs added name/version pairs
+        removed_pkgs: dict[str, str] = {}
+        added_pkgs: dict[str, str] = {}
+
+        # Collect all changed name= and version= lines
+        removed_names: list[str] = []
+        added_names: list[str] = []
+        removed_versions: list[str] = []
+        added_versions: list[str] = []
+
+        name_re = re.compile(r'^name\s*=\s*"([^"]+)"')
+        version_re = re.compile(r'^version\s*=\s*"([^"]+)"')
+
+        for line, _file in lines:
+            if not (line.startswith("+") or line.startswith("-")):
+                continue
+            clean = line[1:].strip()
+
+            nm = name_re.match(clean)
+            if nm:
+                if line.startswith("-"):
+                    removed_names.append(nm.group(1))
+                else:
+                    added_names.append(nm.group(1))
+                continue
+
+            vm = version_re.match(clean)
+            if vm:
+                if line.startswith("-"):
+                    removed_versions.append(vm.group(1))
+                else:
+                    added_versions.append(vm.group(1))
+
+        # Pair up names with their versions (they appear consecutively in poetry.lock)
+        for name, ver in zip(removed_names, removed_versions):
+            removed_pkgs[re.sub(r"[-_.]+", "-", name).lower()] = ver
+        for name, ver in zip(added_names, added_versions):
+            added_pkgs[re.sub(r"[-_.]+", "-", name).lower()] = ver
+
+        # If only versions changed (name line not in diff), look for version-only changes
+        # alongside context lines that have the package name
+        if not removed_names and not added_names and (removed_versions or added_versions):
+            # Fall back: scan context lines for the package name
+            current_name = None
+            for line, _file in lines:
+                clean = (line[1:] if line.startswith(("+", "-", " ")) else line).strip()
+                nm = name_re.match(clean)
+                if nm:
+                    current_name = re.sub(r"[-_.]+", "-", nm.group(1)).lower()
+                vm = version_re.match(clean)
+                if vm and current_name:
+                    if line.startswith("-"):
+                        removed_pkgs[current_name] = vm.group(1)
+                    elif line.startswith("+"):
+                        added_pkgs[current_name] = vm.group(1)
+
+        changes: list[PackageChange] = []
+        for pkg in sorted(set(added_pkgs) | set(removed_pkgs)):
+            if re.match(r"^\d[\d.-]*$", pkg) or len(pkg) < 2:
+                continue
+            if pkg in added_pkgs and pkg in removed_pkgs:
+                changes.append(PackageChange(
+                    name=pkg, change_type="updated",
+                    old_version=removed_pkgs[pkg],
+                    new_version=added_pkgs[pkg],
+                ))
+            elif pkg in added_pkgs:
+                changes.append(PackageChange(
+                    name=pkg, change_type="added",
+                    new_version=added_pkgs[pkg],
+                ))
+            else:
+                changes.append(PackageChange(
+                    name=pkg, change_type="removed",
+                    old_version=removed_pkgs[pkg],
                 ))
         return changes
 
