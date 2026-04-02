@@ -277,10 +277,19 @@ class BlastRadiusAnalyzer:
             key=lambda x: (not x.blocking, x.deploy_order or 999),
         )
 
+        package_changes_dicts = [
+            {"name": pc.name, "change_type": pc.change_type,
+             "old_version": pc.old_version, "new_version": pc.new_version}
+            for pc in pr_diff.package_changes
+        ]
+
         mermaid = generate_mermaid_dag(
             pr_repo=source_repo,
             deploy_order=ai_result.deploy_order,
             downstream=downstream_list,
+            package_changes=package_changes_dicts,
+            vulnerabilities=all_vulnerabilities,
+            repo_incidents=all_repo_incidents,
         )
 
         report = BlastRadiusReport(
@@ -297,11 +306,7 @@ class BlastRadiusAnalyzer:
             mermaid_dag=mermaid,
             vulnerabilities=all_vulnerabilities,
             repo_incidents=all_repo_incidents,
-            package_changes=[
-                {"name": pc.name, "change_type": pc.change_type,
-                 "old_version": pc.old_version, "new_version": pc.new_version}
-                for pc in pr_diff.package_changes
-            ],
+            package_changes=package_changes_dicts,
         )
 
         return format_report(report)

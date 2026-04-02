@@ -207,9 +207,25 @@ def format_report(report: BlastRadiusReport) -> str:
     return "\n".join(lines)
 
 
-def generate_mermaid_dag(pr_repo: str, deploy_order: list[dict], downstream: list[DownstreamImpact]) -> str:
-    """Generate a Mermaid diagram showing the deploy dependency graph."""
-    if not deploy_order and not downstream:
+def generate_mermaid_dag(
+    pr_repo: str,
+    deploy_order: list[dict],
+    downstream: list[DownstreamImpact],
+    package_changes: list[dict] | None = None,
+    vulnerabilities: list[dict] | None = None,
+    repo_incidents: list[dict] | None = None,
+) -> str:
+    """Generate a Mermaid diagram showing the deploy/dependency graph."""
+    package_changes = package_changes or []
+    vulnerabilities = vulnerabilities or []
+    repo_incidents = repo_incidents or []
+
+    has_downstream = bool(deploy_order or downstream)
+    has_packages = bool(package_changes)
+    has_vulns = bool(vulnerabilities)
+    has_incidents = bool(repo_incidents)
+
+    if not has_downstream and not has_packages:
         return ""
 
     lines = ["graph LR"]
@@ -220,6 +236,7 @@ def generate_mermaid_dag(pr_repo: str, deploy_order: list[dict], downstream: lis
     lines.append(f'    {pr_id}["{pr_repo}<br/>This PR"]')
     node_styles[pr_id] = RISK_COLOR["MEDIUM"]
 
+    # --- Downstream service nodes ---
     # Add deploy order nodes
     for step in deploy_order:
         repo = step.get("repo", "?")
@@ -242,6 +259,66 @@ def generate_mermaid_dag(pr_repo: str, deploy_order: list[dict], downstream: lis
             lines.append(f'    {repo_id}["{impact.repo}"]')
             lines.append(f"    {pr_id} -.-> {repo_id}")
             node_styles[repo_id] = "#94a3b8"
+
+    # --- Package dependency nodes ---
+    if has_packages:
+        for pc in package_changes:
+            pkg_name = pc.get("name", "?")
+            pkg_id = _safe_id(f"pkg_{pkg_name}")
+            change = pc.get("change_type", "?")
+            icon = {"added": "+", "removed": "-", "updated": "↑"}.get(change, "•")
+            if change == "updated":
+                ver = f"{pc.get('old_version', '?')} → {pc.get('new_version', '?')}"
+            elif change == "added":
+                ver = pc.get("new_version", "new")
+            else:
+                ver = pc.get("old_version", "removed")
+            lines.append(f'    {pkg_id}(["{icon} {pkg_name}<br/>{ver}"])')
+            lines.append(f"    {pr_id} --> {pkg_id}")
+
+            color = {"added": "#22c55e", "removed": "#ef4444", "updated": "#3b82f6"}.get(change, "#94a3b8")
+            node_styles[pkg_id] = color
+
+            # Link resolved vulns to their package
+            for vuln in vulnerabilities:
+                if vuln.get("pr_impact") == "potentially_resolved":
+                    vuln_pkg = vuln.get("package", "")
+                    import re as _re
+                    if _re.sub(r"[-_.]+", "-", vuln_pkg).lower() == _re.sub(r"[-_.]+", "-", pkg_name).lower():
+                        vuln_id = _safe_id(f"vuln_{vuln_pkg}_{vuln.get('severity', '')}")
+                        if vuln_id not in node_styles:
+                            sev = vuln.get("severity", "?")
+                            lines.append(f'    {vuln_id}{{"🛡️ {sev}: {vuln_pkg}"}}')
+                            lines.append(f"    {pkg_id} -->|resolves| {vuln_id}")
+                            node_styles[vuln_id] = "#22c55e"
+
+        # Show unresolved vulns connected to PR
+        unresolved_critical = [v for v in vulnerabilities if v.get("pr_impact") != "potentially_resolved" and v.get("severity") in ("critical", "high")]
+        if unresolved_critical:
+            vuln_group_id = _safe_id("vuln_unresolved")
+            count = len(unresolved_critical)
+            sev_counts = {}
+            for v in unresolved_critical:
+                s = v.get("severity", "?")
+                sev_counts[s] = sev_counts.get(s, 0) + 1
+            label_parts = [f"{c} {s}" for s, c in sorted(sev_counts.items())]
+            lines.append(f'    {vuln_group_id}{{"⚠️ {count} open vulns<br/>{", ".join(label_parts)}"}}')
+            lines.append(f"    {pr_id} -.->|existing| {vuln_group_id}")
+            node_styles[vuln_group_id] = "#ef4444"
+
+        # Show related incidents connected to PR
+        if has_incidents:
+            inc_id = _safe_id("incidents")
+            revert_count = sum(1 for i in repo_incidents if "revert" in i.get("labels", []))
+            other_count = len(repo_incidents) - revert_count
+            parts = []
+            if revert_count:
+                parts.append(f"{revert_count} reverts")
+            if other_count:
+                parts.append(f"{other_count} issues")
+            lines.append(f'    {inc_id}{{"🔥 {", ".join(parts)}"}}')
+            lines.append(f"    {pr_id} -.->|history| {inc_id}")
+            node_styles[inc_id] = "#f59e0b"
 
     # Add styles
     for node_id, color in node_styles.items():
