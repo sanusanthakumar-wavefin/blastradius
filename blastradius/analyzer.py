@@ -120,8 +120,17 @@ class BlastRadiusAnalyzer:
             # Add to downstream refs — these are "shared dependency" impacts
             all_downstream_refs.extend(shared_pkg_refs)
 
+        # Step 2b: Search for services that depend on this service
+        service_consumer_refs = []
+        try:
+            service_consumer_refs = self.github.search_service_consumers(repo)
+            logger.info("Service '%s': consumed by %d other repos", repo, len(service_consumer_refs))
+        except Exception as e:
+            logger.warning("Service consumer search failed for '%s': %s", repo, e)
+
         # Build set of repos from shared-package search
         shared_pkg_repos = {r.repo_full_name for r in shared_pkg_refs} if pr_diff.package_changes else set()
+        service_consumer_repo_set = {r.repo_full_name for r in service_consumer_refs}
 
         # Step 3: Deduplicate and group references by repo
         seen_refs = set()
@@ -303,6 +312,23 @@ class BlastRadiusAnalyzer:
             for pc in pr_diff.package_changes
         ]
 
+        # Build service consumer dicts for the report
+        service_consumers_dicts = []
+        seen_consumer_repos = set()
+        for ref in service_consumer_refs:
+            # Extract type from symbol like "api (git-dependency)"
+            dep_type = "reference"
+            if "(" in ref.symbol and ")" in ref.symbol:
+                dep_type = ref.symbol.split("(")[-1].rstrip(")")
+            key = (ref.repo_full_name, dep_type)
+            if key not in seen_consumer_repos:
+                seen_consumer_repos.add(key)
+                service_consumers_dicts.append({
+                    "repo": ref.repo_full_name,
+                    "type": dep_type,
+                    "file": ref.file_path,
+                })
+
         mermaid = generate_mermaid_dag(
             pr_repo=source_repo,
             deploy_order=ai_result.deploy_order,
@@ -310,6 +336,7 @@ class BlastRadiusAnalyzer:
             package_changes=package_changes_dicts,
             vulnerabilities=all_vulnerabilities,
             repo_incidents=all_repo_incidents,
+            service_consumers=service_consumers_dicts,
         )
 
         report = BlastRadiusReport(
@@ -327,6 +354,7 @@ class BlastRadiusAnalyzer:
             vulnerabilities=all_vulnerabilities,
             repo_incidents=all_repo_incidents,
             package_changes=package_changes_dicts,
+            service_consumers=service_consumers_dicts,
         )
 
         return format_report(report)

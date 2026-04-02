@@ -185,6 +185,55 @@ class GitHubClient:
                 logger.warning("Package search failed for '%s' in %s: %s", package_name, filename, e)
         return refs
 
+    def search_service_consumers(self, repo_name: str) -> list[DownstreamRef]:
+        """Find repos that depend on this service (git deps, gRPC clients, docker-compose, imports)."""
+        refs = []
+        source_repo = f"{self.org}/{repo_name}"
+
+        # Search patterns that indicate a service dependency
+        search_queries = [
+            # Git-based Python package dependency (pip install from git)
+            (f"waveaccounting/{repo_name} org:{self.org} filename:pyproject.toml", "git-dependency"),
+            (f"waveaccounting/{repo_name} org:{self.org} filename:requirements.txt", "git-dependency"),
+            # gRPC / protobuf client references
+            (f"{repo_name} org:{self.org} filename:proto", "grpc-client"),
+            # Docker-compose service references
+            (f"{repo_name} org:{self.org} filename:docker-compose", "docker-compose"),
+            # Import references (Python packages named after the repo)
+            (f"from {repo_name} org:{self.org} language:python", "import"),
+            # Service URL / client references
+            (f"{repo_name}-service org:{self.org} language:python", "service-client"),
+        ]
+
+        seen = set()
+        for query, ref_type in search_queries:
+            try:
+                time.sleep(2)
+                results = self.gh.search_code(query)
+                count = 0
+                for item in results:
+                    if count >= 15:
+                        break
+                    if item.repository.full_name == source_repo:
+                        continue
+                    key = (item.repository.full_name, item.path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    refs.append(
+                        DownstreamRef(
+                            repo_full_name=item.repository.full_name,
+                            file_path=item.path,
+                            symbol=f"{repo_name} ({ref_type})",
+                            matched_fragment="",
+                        )
+                    )
+                    count += 1
+            except Exception as e:
+                logger.debug("Service consumer search failed for '%s' (%s): %s", query[:50], ref_type, e)
+
+        return refs
+
     def get_vulnerability_alerts(self, repo_full_name: str) -> list[VulnerabilityAlert]:
         """Get Dependabot security alerts for a repo using the REST API."""
         alerts = []

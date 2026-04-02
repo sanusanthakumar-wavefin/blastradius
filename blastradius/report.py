@@ -52,6 +52,7 @@ class BlastRadiusReport:
     vulnerabilities: list[dict] = field(default_factory=list)
     repo_incidents: list[dict] = field(default_factory=list)
     package_changes: list[dict] = field(default_factory=list)
+    service_consumers: list[dict] = field(default_factory=list)
     mermaid_dag: str = ""
 
 
@@ -107,6 +108,25 @@ def format_report(report: BlastRadiusReport) -> str:
                 dep_file = impact.files[0] if impact.files else "—"
                 lines.append(f"| `{repo_short}` | {dep_file} |")
             lines.append("")
+
+    # Service consumers — services that depend on this service
+    if report.service_consumers:
+        # Group by dependency type
+        by_type: dict[str, list[dict]] = {}
+        for sc in report.service_consumers:
+            dep_type = sc.get("type", "reference")
+            by_type.setdefault(dep_type, []).append(sc)
+
+        lines.append(f"### 🏗️ Services Depending on This Service ({len(report.service_consumers)} refs)")
+        lines.append("")
+        lines.append("> Changes to this service may impact these consumers:")
+        lines.append("")
+        lines.append("| Service | Type | File |")
+        lines.append("|---------|------|------|")
+        for sc in report.service_consumers:
+            repo_short = sc.get("repo", "?").split("/")[-1]
+            lines.append(f"| `{repo_short}` | {sc.get('type', '?')} | {sc.get('file', '—')} |")
+        lines.append("")
 
     # Deploy order (if needed)
     if report.deploy_order:
@@ -240,18 +260,21 @@ def generate_mermaid_dag(
     package_changes: list[dict] | None = None,
     vulnerabilities: list[dict] | None = None,
     repo_incidents: list[dict] | None = None,
+    service_consumers: list[dict] | None = None,
 ) -> str:
     """Generate a Mermaid diagram showing the deploy/dependency graph."""
     package_changes = package_changes or []
     vulnerabilities = vulnerabilities or []
     repo_incidents = repo_incidents or []
+    service_consumers = service_consumers or []
 
     has_downstream = bool(deploy_order or downstream)
     has_packages = bool(package_changes)
     has_vulns = bool(vulnerabilities)
     has_incidents = bool(repo_incidents)
+    has_consumers = bool(service_consumers)
 
-    if not has_downstream and not has_packages:
+    if not has_downstream and not has_packages and not has_consumers:
         return ""
 
     lines = ["graph LR"]
@@ -370,6 +393,32 @@ def generate_mermaid_dag(
             lines.append(f'    {inc_id}{{"🔥 {", ".join(parts)}"}}')
             lines.append(f"    {pr_id} -.->|history| {inc_id}")
             node_styles[inc_id] = "#f59e0b"
+
+    # --- Service consumer nodes ---
+    if has_consumers:
+        # Deduplicate by repo
+        consumer_repos: dict[str, list[str]] = {}
+        for sc in service_consumers:
+            repo = sc.get("repo", "?")
+            short = repo.split("/")[-1] if "/" in repo else repo
+            dep_type = sc.get("type", "reference")
+            consumer_repos.setdefault(short, []).append(dep_type)
+
+        shown = 0
+        for short_name, types in consumer_repos.items():
+            if shown >= 8:
+                remaining = len(consumer_repos) - shown
+                more_id = _safe_id("more_consumers")
+                lines.append(f'    {more_id}["+{remaining} more services"]')
+                lines.append(f"    {more_id} -->|depends on| {pr_id}")
+                node_styles[more_id] = "#94a3b8"
+                break
+            consumer_id = _safe_id(f"svc_{short_name}")
+            dep_label = types[0] if len(types) == 1 else f"{len(types)} refs"
+            lines.append(f'    {consumer_id}["{short_name}"]')
+            lines.append(f"    {consumer_id} -->|{dep_label}| {pr_id}")
+            node_styles[consumer_id] = "#8b5cf6"
+            shown += 1
 
     # Add styles
     for node_id, color in node_styles.items():
