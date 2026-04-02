@@ -1,0 +1,20 @@
+[project]
+name = "blastradius"
+version = "0.1.0"
+description = "Automated cross-repo PR impact analysis for every PR"
+requires-python = ">=3.11"
+dependencies = [
+    "PyGithub>=2.1.0",
+    "requests>=2.31.0",
+    "openai>=1.12.0",
+    "mcp[cli]>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+blastradius = "blastradius.cli:main"
+blastradius-mcp = "blastradius.mcp_server:main"
